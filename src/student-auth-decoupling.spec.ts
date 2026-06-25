@@ -92,6 +92,7 @@ describe('student auth decoupling', () => {
         })),
       } as any,
       { findById: jest.fn(async () => ({ _id: groupId })) } as any,
+      { log: jest.fn() } as any,
     );
 
     const result = await service.create(

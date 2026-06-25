@@ -5,4 +5,5 @@ export enum PaymentStatus {
   Debt = 'debt',
   Frozen = 'frozen',
   Overpaid = 'overpaid',
+  Cancelled = 'cancelled',
 }

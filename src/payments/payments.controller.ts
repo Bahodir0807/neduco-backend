@@ -1,4 +1,4 @@
-﻿import {
+import {
   Body,
   Controller,
   Delete,
@@ -11,6 +11,7 @@
 } from '@nestjs/common';
 import { PaymentsService } from './payments.service';
 import { CreatePaymentDto } from './dto/create-payments.dto';
+import { UpdatePaymentDto } from './dto/update-payment.dto';
 import { Roles } from '../roles/roles.decorator';
 import { Role } from '../roles/roles.enum';
 import { PaymentsListQueryDto } from './dto/payments-list-query.dto';
@@ -162,13 +163,6 @@ export class PaymentsController {
       dto.freezeFrom,
       dto.freezeTo,
     );
-    this.auditLogService.log({
-      action: 'payment.freeze',
-      actor: { id: req.user.userId, role: req.user.role },
-      target: { type: 'payment', id: params.id },
-      status: 'success',
-      metadata: { reason: dto.reason },
-    });
     return payment;
   }
 
@@ -179,12 +173,6 @@ export class PaymentsController {
       params.id,
       req.user as AuthenticatedUser,
     );
-    this.auditLogService.log({
-      action: 'payment.unfreeze',
-      actor: { id: req.user.userId, role: req.user.role },
-      target: { type: 'payment', id: params.id },
-      status: 'success',
-    });
     return payment;
   }
 
@@ -192,7 +180,7 @@ export class PaymentsController {
   @Roles(Role.Owner, Role.Extra)
   async update(
     @Param() params: IdParamDto,
-    @Body() dto: Partial<CreatePaymentDto>,
+    @Body() dto: UpdatePaymentDto,
     @Request() req,
   ) {
     const payment = await this.paymentsService.update(
@@ -209,17 +197,11 @@ export class PaymentsController {
     return payment;
   }
 
-  @Delete(':id')
+  @Patch(':id/cancel')
   @Roles(Role.Owner, Role.Extra)
-  async delete(@Param() params: IdParamDto, @Request() req) {
+  async cancelPayment(@Param() params: IdParamDto, @Request() req) {
     const { id } = params;
-    await this.paymentsService.delete(id, req.user as AuthenticatedUser);
-    this.auditLogService.log({
-      action: 'payment.delete',
-      actor: { id: req.user.userId, role: req.user.role },
-      target: { type: 'payment', id },
-      status: 'success',
-    });
-    return { message: 'Payment deleted successfully' };
+    await this.paymentsService.softCancel(id, req.user as AuthenticatedUser);
+    return { message: 'Payment cancelled successfully' };
   }
 }

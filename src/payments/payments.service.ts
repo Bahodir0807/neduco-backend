@@ -5,6 +5,7 @@
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
+import { AuditLogService } from '../common/audit/audit-log.service';
 import { InjectConnection, InjectModel } from '@nestjs/mongoose';
 import {
   Connection,
@@ -17,6 +18,7 @@ import {
 import { Payment, PaymentDocument } from './schemas/payment.schema';
 import { PaymentsRepository } from './payments.repository';
 import { CreatePaymentDto } from './dto/create-payments.dto';
+import { UpdatePaymentDto } from './dto/update-payment.dto';
 import { Course, CourseDocument } from '../courses/schemas/course.schema';
 import { Student, StudentDocument } from '../students/schemas/student.schema';
 import { Group, GroupDocument } from '../groups/schemas/group.schema';
@@ -108,6 +110,7 @@ export class PaymentsService {
     private readonly studentModel: Model<StudentDocument>,
     @InjectModel(Group.name)
     private readonly groupModel: Model<GroupDocument>,
+    private readonly auditLogService: AuditLogService,
   ) {}
 
   private isRootRole(role?: Role): boolean {
@@ -593,14 +596,34 @@ export class PaymentsService {
     this.assertCanReadPayment(actor, payment);
     this.assertCanModifyPayment(actor);
 
-    payment.isFrozen = true;
-    payment.freezeReason = reason;
-    payment.freezeFrom = freezeFrom || new Date();
-    payment.freezeTo = freezeTo;
-    payment.status = PaymentStatus.Frozen;
+    const session = await this.connection.startSession();
+    session.startTransaction();
 
-    const updated = await payment.save();
-    return mapPaymentResponse(updated);
+    try {
+      payment.isFrozen = true;
+      payment.freezeReason = reason;
+      payment.freezeFrom = freezeFrom || new Date();
+      payment.freezeTo = freezeTo;
+      payment.status = PaymentStatus.Frozen;
+
+      const updated = await payment.save({ session });
+
+      this.auditLogService.log({
+        action: 'payment.freeze',
+        actor: { id: actor.userId, role: actor.role },
+        target: { type: 'payment', id: paymentId },
+        status: 'success',
+        metadata: { reason },
+      });
+
+      await session.commitTransaction();
+      return mapPaymentResponse(updated);
+    } catch (error) {
+      await session.abortTransaction();
+      throw error;
+    } finally {
+      await session.endSession();
+    }
   }
 
   async unfreezePayment(
@@ -618,15 +641,34 @@ export class PaymentsService {
       throw new BadRequestException('Payment is not frozen');
     }
 
-    payment.isFrozen = false;
-    payment.freezeReason = undefined;
-    payment.freezeFrom = undefined;
-    payment.freezeTo = undefined;
+    const session = await this.connection.startSession();
+    session.startTransaction();
 
-    this.applyLifecycle(payment);
+    try {
+      payment.isFrozen = false;
+      payment.freezeReason = undefined;
+      payment.freezeFrom = undefined;
+      payment.freezeTo = undefined;
 
-    const updated = await payment.save();
-    return mapPaymentResponse(updated);
+      this.applyLifecycle(payment);
+
+      const updated = await payment.save({ session });
+
+      this.auditLogService.log({
+        action: 'payment.unfreeze',
+        actor: { id: actor.userId, role: actor.role },
+        target: { type: 'payment', id: paymentId },
+        status: 'success',
+      });
+
+      await session.commitTransaction();
+      return mapPaymentResponse(updated);
+    } catch (error) {
+      await session.abortTransaction();
+      throw error;
+    } finally {
+      await session.endSession();
+    }
   }
 
   async getAll(
@@ -665,8 +707,27 @@ export class PaymentsService {
     query: PaymentsListQueryDto = {},
     actor: AuthenticatedUser,
   ): Promise<any> {
-    const student = await this.verifyStudentExists(studentId);
-    this.assertActorCanAccessStudent(actor, student);
+    // ── Task 1: Explicit Ownership Verification (IDOR fix) ──
+    if (actor.role === Role.Admin) {
+      const student = await this.verifyStudentExists(studentId);
+      const actorBranches = this.ensureScopedActorHasBranches(actor);
+      const studentBranches = this.normalizeBranchIds(
+        (student as unknown as { branchIds?: unknown[] }).branchIds,
+      );
+      const hasAccess = studentBranches.some((bId) =>
+        actorBranches.includes(bId),
+      );
+      if (!hasAccess) {
+        throw new NotFoundException(
+          'Студент не найден в вашем филиале',
+        );
+      }
+    } else if (actor.role === Role.Student) {
+      if (studentId !== actor.userId) {
+        throw new ForbiddenException('You are not allowed to view this student\'s payments');
+      }
+    }
+    // Root roles (Owner, Extra) skip ownership check — full access
 
     const filter = {
       ...this.buildFilter(query),
@@ -701,7 +762,7 @@ export class PaymentsService {
 
   async update(
     id: string,
-    dto: Partial<CreatePaymentDto>,
+    dto: UpdatePaymentDto,
     actor: AuthenticatedUser,
   ): Promise<any> {
     const payment = await this.paymentsRepository.findById(id);
@@ -719,32 +780,32 @@ export class PaymentsService {
       throw new BadRequestException('Cannot modify frozen payment');
     }
 
-    // Only allow comment updates on locked payments
+    // Only allow comment or amount updates on locked payments
     if (
       payment.status === PaymentStatus.Paid ||
       payment.status === PaymentStatus.Debt
     ) {
-      if (Object.keys(dto).some((key) => key !== 'comment')) {
+      if (Object.keys(dto).some((key) => key !== 'comment' && key !== 'amount')) {
         throw new BadRequestException('Cannot modify locked payment');
       }
     }
 
-    const updateData: any = {};
+    const updateData: Record<string, unknown> = {};
     if (dto.comment !== undefined) {
       updateData.comment = dto.comment;
     }
-    if (dto.expectedAmount !== undefined) {
-      if (dto.expectedAmount <= 0) {
-        throw new BadRequestException('Expected amount must be greater than 0');
+    if (dto.amount !== undefined) {
+      if (dto.amount <= 0) {
+        throw new BadRequestException('Amount must be greater than 0');
       }
-      payment.expectedAmount = dto.expectedAmount;
+      payment.paidAmount = dto.amount;
     }
     if (dto.dueDate !== undefined) {
       payment.dueDate = new Date(dto.dueDate);
     }
-    if (dto.expectedAmount !== undefined || dto.dueDate !== undefined) {
+    if (dto.amount !== undefined || dto.dueDate !== undefined) {
       this.applyLifecycle(payment);
-      updateData.expectedAmount = payment.expectedAmount;
+      updateData.paidAmount = payment.paidAmount;
       updateData.remainingAmount = payment.remainingAmount;
       updateData.overpaidAmount = payment.overpaidAmount;
       updateData.status = payment.status;
@@ -755,7 +816,7 @@ export class PaymentsService {
     return mapPaymentResponse(updated);
   }
 
-  async delete(id: string, actor: AuthenticatedUser): Promise<void> {
+  async softCancel(id: string, actor: AuthenticatedUser): Promise<void> {
     const payment = await this.paymentsRepository.findById(id);
     if (!payment) {
       throw new NotFoundException('Payment not found');
@@ -763,14 +824,51 @@ export class PaymentsService {
     this.assertCanReadPayment(actor, payment);
     this.assertCanModifyPayment(actor);
 
-    // Edge case: cannot delete if payment history exists
-    if (payment.paymentHistory && payment.paymentHistory.length > 0) {
+    // Edge case: already cancelled
+    if (payment.status === PaymentStatus.Cancelled) {
+      throw new BadRequestException('Payment is already cancelled');
+    }
+
+    // Edge case: frozen payment cannot be cancelled
+    if (payment.isFrozen) {
       throw new BadRequestException(
-        'Cannot delete payment with transaction history',
+        'Cannot cancel a frozen payment. Unfreeze first.',
       );
     }
 
-    await this.paymentsRepository.deleteOne(id);
+    const session = await this.connection.startSession();
+    session.startTransaction();
+
+    try {
+      const oldStatus = payment.status;
+
+      payment.status = PaymentStatus.Cancelled;
+      payment.isFrozen = false;
+      payment.freezeReason = undefined;
+      payment.freezeFrom = undefined;
+      payment.freezeTo = undefined;
+      payment.comment = payment.comment
+        ? `Аннулировано владельцем [${actor.userId}]. ${payment.comment}`
+        : `Аннулировано владельцем [${actor.userId}]`;
+
+      await payment.save({ session });
+
+      this.auditLogService.log({
+        action: 'payment.cancel',
+        actor: { id: actor.userId, role: actor.role },
+        target: { type: 'payment', id },
+        status: 'success',
+        oldValue: { status: oldStatus },
+        newValue: { status: PaymentStatus.Cancelled },
+      });
+
+      await session.commitTransaction();
+    } catch (error) {
+      await session.abortTransaction();
+      throw error;
+    } finally {
+      await session.endSession();
+    }
   }
 
   async getStatistics(

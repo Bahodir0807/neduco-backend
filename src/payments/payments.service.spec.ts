@@ -84,6 +84,7 @@ function createService() {
     findOne: jest.fn(),
     find: jest.fn(),
   };
+  const auditLogService = { log: jest.fn(), logFailure: jest.fn() };
 
   return {
     service: new PaymentsService(
@@ -92,6 +93,7 @@ function createService() {
       courseModel as any,
       studentModel as any,
       groupModel as any,
+      auditLogService as any,
     ),
     paymentsRepository,
     connection,
